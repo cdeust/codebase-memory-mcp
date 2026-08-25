@@ -1,19 +1,22 @@
 /*
- * pass_doclinks.c — Documentation → file reference linking (pre-dump pass).
+ * pass_doclinks.c — Documentation/shell → file reference linking (pre-dump pass).
  *
- * Markdown docs reference other repo files constantly — a coding-standards
- * doc links to the modules it governs, a README points at entry points —
- * but none of that surfaced as graph edges, so fan-in queries were blind to
- * documentation hubs: on a docs-heavy repo the top fan-in answer was off by
- * an order of magnitude because the most-referenced doc had zero inbound
+ * Markdown docs and shell scripts reference other repo files constantly — a
+ * coding-standards doc links to the modules it governs, a script sources a
+ * helper library or invokes a sibling tool — but none of that surfaced as
+ * graph edges, so fan-in queries were blind to documentation and shell hubs:
+ * on a shell/markdown-heavy repo the top fan-in answer was off by an order of
+ * magnitude because the most-referenced doc and shell tool had zero inbound
  * edges.
  *
- * Three strategies emit REFERENCES_FILE edges between EXISTING File nodes
+ * Five strategies emit REFERENCES_FILE edges between EXISTING File nodes
  * (targets that don't resolve to an indexed file are dropped — the pass
  * never invents nodes):
  *   MD 1. Inline link:    [text](relative/path.ext)   (not http/mailto/#anchor)
  *   MD 2. Backtick path:  `path/with/slash.ext` or `file.ext`
  *   MD 3. Bare mention:   relative/path.ext            (slash + extension)
+ *   SH 1. Source line:    source path  /  . path
+ *   SH 2. Invocation:     ./scripts/foo.sh, scripts/foo.sh (path-shaped token)
  *
  * Targets resolve relative to the referencing file's directory AND the repo
  * root (docs are written both ways). Repeated references between the same
@@ -45,6 +48,9 @@
 #define DOCLINK_MD_INLINE 0.95
 #define DOCLINK_MD_BACKTICK 0.85
 #define DOCLINK_MD_BARE 0.70
+/* Shell strategies */
+#define DOCLINK_SH_SOURCE 0.95
+#define DOCLINK_SH_INVOKE 0.85
 
 /* Edge type emitted by this pass. */
 #define DOCLINK_EDGE_TYPE "REFERENCES_FILE"
@@ -69,6 +75,14 @@ static const char *doclink_path_ext(const char *path) {
 static bool doclink_is_markdown_path(const char *path) {
     const char *ext = doclink_path_ext(path);
     return ext && (strcmp(ext, ".md") == 0 || strcmp(ext, ".mdx") == 0);
+}
+
+/* Shell as discovered by language.c extension mapping (.sh/.bash → Bash,
+ * .zsh → Zsh). Extensionless shebang scripts are out of scope here. */
+static bool doclink_is_shell_path(const char *path) {
+    const char *ext = doclink_path_ext(path);
+    return ext &&
+           (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || strcmp(ext, ".zsh") == 0);
 }
 
 /* ── File reading (mirrors pass_semantic.c read_file, minus TS pad) ── */
@@ -378,10 +392,95 @@ static void doclink_scan_md_line(doclink_ctx_t *dc, char *line) {
     doclink_scan_md_bare(dc, line);
 }
 
+/* ── Shell scanning ──────────────────────────────────────────────── */
+
+/* Strip one layer of surrounding quotes in place. */
+static void doclink_strip_quotes(char *tok) {
+    size_t len = strlen(tok);
+    if (len >= CBM_QUOTE_PAIR && ((tok[0] == '"' && tok[len - SKIP_ONE] == '"') ||
+                                  (tok[0] == '\'' && tok[len - SKIP_ONE] == '\''))) {
+        memmove(tok, tok + CBM_QUOTE_OFFSET, len - CBM_QUOTE_PAIR);
+        tok[len - CBM_QUOTE_PAIR] = '\0';
+    }
+}
+
+/* SH 1: `source path` / `. path` (same shapes cbm_parse_shell_source accepts).
+ * Returns true when the line was a source line (invocation scan then skips
+ * it, so the sourced path is not double-counted). */
+static bool doclink_scan_sh_source(doclink_ctx_t *dc, const char *line) {
+    const char *p = NULL;
+    if (strncmp(line, "source", SLEN("source")) == 0 &&
+        (line[SLEN("source")] == ' ' || line[SLEN("source")] == '\t')) {
+        p = line + SLEN("source") + SKIP_ONE;
+    } else if (line[0] == '.' && (line[SKIP_ONE] == ' ' || line[SKIP_ONE] == '\t')) {
+        p = line + PAIR_LEN;
+    }
+    if (!p) {
+        return false;
+    }
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    char path[CBM_SZ_512];
+    (void)snprintf(path, sizeof(path), "%s", p);
+    char *space = strchr(path, ' ');
+    if (space) {
+        *space = '\0'; /* drop trailing args */
+    }
+    doclink_strip_quotes(path);
+    if (path[0] != '\0' && strchr(path, '$') == NULL) {
+        doclink_record(dc, doclink_resolve(dc, path), DOCLINK_SH_SOURCE, "sh_source");
+    }
+    return true;
+}
+
+/* SH 2: invocation of a repo-relative script. There is no precedent in this
+ * codebase for peeling "$VAR"/ prefixes off paths, so only the unambiguous
+ * forms count: a whitespace-separated token that is path-shaped (contains a
+ * slash, or starts with "./"), holds no shell expansion, and resolves to an
+ * indexed file. Argument position is deliberately included — `bash x.sh` and
+ * `cp tools/gen.sh dest` both reference the script. */
+static void doclink_scan_sh_invoke(doclink_ctx_t *dc, const char *line) {
+    const char *p = line;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        size_t tlen = (size_t)(p - start);
+        char tok[CBM_SZ_512];
+        if (tlen == 0 || tlen >= sizeof(tok)) {
+            continue;
+        }
+        memcpy(tok, start, tlen);
+        tok[tlen] = '\0';
+        while (tlen > 0 && strchr(";|&)", tok[tlen - SKIP_ONE]) != NULL) {
+            tok[--tlen] = '\0'; /* command separators glued to the token */
+        }
+        doclink_strip_quotes(tok);
+        if (tok[0] == '-' || strchr(tok, '$') != NULL || strchr(tok, '=') != NULL ||
+            strstr(tok, "://") != NULL || strchr(tok, '/') == NULL) {
+            continue;
+        }
+        doclink_record(dc, doclink_resolve(dc, tok), DOCLINK_SH_INVOKE, "sh_invoke");
+    }
+}
+
+static void doclink_scan_sh_line(doclink_ctx_t *dc, const char *trimmed) {
+    if (doclink_scan_sh_source(dc, trimmed)) {
+        return;
+    }
+    doclink_scan_sh_invoke(dc, trimmed);
+}
+
 /* ── Per-file driver ─────────────────────────────────────────────── */
 
 /* Scan one referencing file's content line by line and emit its edges. */
-static int doclink_scan_file(doclink_ctx_t *dc, const cbm_gbuf_node_t *node, const char *source) {
+static int doclink_scan_file(doclink_ctx_t *dc, const cbm_gbuf_node_t *node, const char *source,
+                             bool is_markdown) {
     dc->src = node;
     dc->ref_count = 0;
     dc->truncated = false;
@@ -408,29 +507,47 @@ static int doclink_scan_file(doclink_ctx_t *dc, const cbm_gbuf_node_t *node, con
         line[line_len] = '\0';
         p = eol ? eol + SKIP_ONE : p + line_len;
 
-        doclink_scan_md_line(dc, line);
+        if (is_markdown) {
+            doclink_scan_md_line(dc, line);
+        } else {
+            char *trimmed = line;
+            while (*trimmed == ' ' || *trimmed == '\t') {
+                trimmed++;
+            }
+            if (*trimmed == '\0' || *trimmed == '#') {
+                continue; /* blank, comment, shebang */
+            }
+            doclink_scan_sh_line(dc, trimmed);
+        }
     }
     return doclink_flush(dc);
 }
 
 /* ── Pass entry point ────────────────────────────────────────────── */
 
-/* True when at least one File node is a markdown file. */
+/* True when at least one File node is a markdown or shell file. */
 static bool doclink_has_doc_files(const cbm_gbuf_node_t *const *files, int file_count) {
     for (int i = 0; i < file_count; i++) {
-        if (doclink_is_markdown_path(files[i]->file_path)) {
+        if (doclink_is_markdown_path(files[i]->file_path) ||
+            doclink_is_shell_path(files[i]->file_path)) {
             return true;
         }
     }
     return false;
 }
 
-/* Scan every markdown File node's on-disk content, emitting edges.
- * md_edges receives the emitted edge count. */
+/* Scan every markdown/shell File node's on-disk content, emitting edges.
+ * md_edges/sh_edges receive the per-family emitted edge counts. */
 static void doclink_scan_repo(doclink_ctx_t *dc, const char *repo_path,
-                              const cbm_gbuf_node_t *const *files, int file_count, int *md_edges) {
+                              const cbm_gbuf_node_t *const *files, int file_count, int *md_edges,
+                              int *sh_edges) {
     for (int i = 0; i < file_count; i++) {
-        if (!files[i]->file_path || !doclink_is_markdown_path(files[i]->file_path)) {
+        if (!files[i]->file_path) {
+            continue;
+        }
+        bool is_md = doclink_is_markdown_path(files[i]->file_path);
+        bool is_sh = !is_md && doclink_is_shell_path(files[i]->file_path);
+        if (!is_md && !is_sh) {
             continue;
         }
 
@@ -443,9 +560,9 @@ static void doclink_scan_repo(doclink_ctx_t *dc, const char *repo_path,
         if (!source) {
             continue;
         }
-        int emitted = doclink_scan_file(dc, files[i], source);
+        int emitted = doclink_scan_file(dc, files[i], source, is_md);
         free(source);
-        *md_edges += emitted;
+        *(is_md ? md_edges : sh_edges) += emitted;
     }
 }
 
@@ -483,13 +600,19 @@ int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx) {
     }
 
     int md_edges = 0;
-    doclink_scan_repo(&dc, ctx->repo_path, files, file_count, &md_edges);
+    int sh_edges = 0;
+    doclink_scan_repo(&dc, ctx->repo_path, files, file_count, &md_edges, &sh_edges);
     cbm_ht_free(dc.files_by_path);
 
     char buf1[CBM_SZ_16];
+    char buf2[CBM_SZ_16];
+    char buf3[CBM_SZ_16];
     (void)snprintf(buf1, sizeof(buf1), "%d", md_edges);
     cbm_log_info("doclinks.strategy", "name", "markdown", "edges", buf1);
-    cbm_log_info("doclinks.done", "total", buf1);
+    (void)snprintf(buf2, sizeof(buf2), "%d", sh_edges);
+    cbm_log_info("doclinks.strategy", "name", "shell", "edges", buf2);
+    (void)snprintf(buf3, sizeof(buf3), "%d", md_edges + sh_edges);
+    cbm_log_info("doclinks.done", "total", buf3);
 
-    return md_edges;
+    return md_edges + sh_edges;
 }

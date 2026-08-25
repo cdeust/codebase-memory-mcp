@@ -206,6 +206,77 @@ TEST(doclinks_md_link_with_anchor_resolves_file) {
     PASS();
 }
 
+/* ── Shell: source line ──────────────────────────────────────────── */
+
+TEST(doclinks_sh_source) {
+    dl_fix_t fx;
+    ASSERT_TRUE(dl_fix_init(&fx));
+
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/run.sh"), "#!/bin/sh\n"
+                                                        "source scripts/env.sh\n"
+                                                        ". ./lib.sh\n"
+                                                        "# source scripts/commented-out.sh\n");
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/env.sh"), "export A=1\n");
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/lib.sh"), "b() { :; }\n");
+
+    int64_t run_id = add_file_node(fx.gb, fx.project, "scripts/run.sh");
+    int64_t env_id = add_file_node(fx.gb, fx.project, "scripts/env.sh");
+    int64_t lib_id = add_file_node(fx.gb, fx.project, "scripts/lib.sh");
+
+    int n = run_doclinks(fx.gb, fx.project, fx.tmpdir);
+    ASSERT_EQ(n, 2);
+
+    /* repo-root-relative source */
+    const cbm_gbuf_edge_t *e1 = find_ref_edge(fx.gb, run_id, env_id);
+    ASSERT_NOT_NULL(e1);
+    ASSERT_TRUE(edge_has_strategy(e1, "sh_source"));
+    ASSERT_NOT_NULL(strstr(e1->properties_json, "\"confidence\":0.95"));
+
+    /* dot-source relative to the script's own directory */
+    const cbm_gbuf_edge_t *e2 = find_ref_edge(fx.gb, run_id, lib_id);
+    ASSERT_NOT_NULL(e2);
+    ASSERT_TRUE(edge_has_strategy(e2, "sh_source"));
+
+    dl_fix_free(&fx);
+    PASS();
+}
+
+/* ── Shell: script invocation ────────────────────────────────────── */
+
+TEST(doclinks_sh_invocation) {
+    dl_fix_t fx;
+    ASSERT_TRUE(dl_fix_init(&fx));
+
+    th_write_file(TH_PATH(fx.tmpdir, "ci.sh"),
+                  "#!/bin/sh\n"
+                  "./scripts/build.sh --fast\n"
+                  "bash scripts/test.sh\n"
+                  "\"$ROOT\"/scripts/skipped.sh\n" /* $-expansion: no precedent, skipped */
+                  "curl https://example.com/x.sh\n");
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/build.sh"), "#!/bin/sh\n");
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/test.sh"), "#!/bin/sh\n");
+    th_write_file(TH_PATH(fx.tmpdir, "scripts/skipped.sh"), "#!/bin/sh\n");
+
+    int64_t ci_id = add_file_node(fx.gb, fx.project, "ci.sh");
+    int64_t build_id = add_file_node(fx.gb, fx.project, "scripts/build.sh");
+    int64_t test_id = add_file_node(fx.gb, fx.project, "scripts/test.sh");
+    int64_t skip_id = add_file_node(fx.gb, fx.project, "scripts/skipped.sh");
+
+    int n = run_doclinks(fx.gb, fx.project, fx.tmpdir);
+    ASSERT_EQ(n, 2);
+
+    const cbm_gbuf_edge_t *e1 = find_ref_edge(fx.gb, ci_id, build_id);
+    ASSERT_NOT_NULL(e1);
+    ASSERT_TRUE(edge_has_strategy(e1, "sh_invoke"));
+    ASSERT_NOT_NULL(strstr(e1->properties_json, "\"confidence\":0.85"));
+
+    ASSERT_NOT_NULL(find_ref_edge(fx.gb, ci_id, test_id));
+    ASSERT_NULL(find_ref_edge(fx.gb, ci_id, skip_id));
+
+    dl_fix_free(&fx);
+    PASS();
+}
+
 /* ── Dedupe: repeated references collapse to one counted edge ────── */
 
 TEST(doclinks_dedupe_keeps_count) {
@@ -303,6 +374,10 @@ SUITE(doclinks) {
     RUN_TEST(doclinks_md_bare_mention);
     RUN_TEST(doclinks_md_non_file_link_ignored);
     RUN_TEST(doclinks_md_link_with_anchor_resolves_file);
+
+    /* Shell strategies */
+    RUN_TEST(doclinks_sh_source);
+    RUN_TEST(doclinks_sh_invocation);
 
     /* Dedupe + resolution + guards */
     RUN_TEST(doclinks_dedupe_keeps_count);
